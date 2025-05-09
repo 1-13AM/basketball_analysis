@@ -20,5 +20,8 @@ gunicorn==19.5.0
 pillow==11.2.1
 image==1.5.33
 scipy==1.15.2
-mediapipe
+# tensorflow
+ultralytics==8.0.178
+torch>=1.7.0
+inference-sdk
 

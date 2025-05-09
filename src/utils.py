@@ -1,9 +1,9 @@
-\
+
 import time
 from absl import app, logging
 import cv2
 import numpy as np
-import tensorflow.compat.v1 as tf
+# import tensorflow.compat.v1 as tf
 from flask import Flask, request, Response, jsonify, send_from_directory, abort
 import os
 # Import MediaPipe
@@ -14,40 +14,35 @@ from sys import platform
 import argparse
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-tf.disable_v2_behavior()
 
 # Initialize MediaPipe solutions (do this once)
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-def tensorflow_init():
-    MODEL_NAME = 'inference_graph'
-    PATH_TO_CKPT = MODEL_NAME + '/frozen_inference_graph.pb'
-
-    detection_graph = tf.Graph()
-    with detection_graph.as_default():
-        od_graph_def = tf.GraphDef()
-        with tf.gfile.GFile(PATH_TO_CKPT, 'rb') as fid:
-            serialized_graph = fid.read()
-            od_graph_def.ParseFromString(serialized_graph)
-            tf.import_graph_def(od_graph_def, name='')
-
-    image_tensor = detection_graph.get_tensor_by_name('image_tensor:0')
-    boxes = detection_graph.get_tensor_by_name('detection_boxes:0')
-    scores = detection_graph.get_tensor_by_name('detection_scores:0')
-    classes = detection_graph.get_tensor_by_name('detection_classes:0')
-    num_detections = detection_graph.get_tensor_by_name('num_detections:0')
-    return detection_graph, image_tensor, boxes, scores, classes, num_detections
-
-# Remove openpose_init function
-# def openpose_init():
-#     ... (removed) ...
+def yolo_init():
+    """
+    Initialize the YOLO model for basketball shot detection.
+    Returns a ShotDetector instance that provides the same interface as TensorFlow.
+    """
+    try:
+        from basketball_shot_detector_model.shot_detector import ShotDetector
+        # Initialize the model with the best.pt file
+        detector = ShotDetector()
+        return detector
+    except ImportError as e:
+        print("Error while loading YOLO model: ", e)
+        
+model = yolo_init()
 
 def fit_func(x, a, b, c):
     return a*(x ** 2) + b * x + c
 
 def trajectory_fit(balls, height, width, shotJudgement, fig):
+    # Don't clear the figure - we want to accumulate trajectories
+    # Get the current axes or create one if none exists
+    ax = fig.gca()
+    
     x = [ball[0] for ball in balls]
     y = [height - ball[1] for ball in balls]
 
@@ -63,13 +58,11 @@ def trajectory_fit(balls, height, width, shotJudgement, fig):
     y_pos = [(a * (x_val ** 2)) + (b * x_val) + c for x_val in x_pos]
 
     if(shotJudgement == "MISS"):
-        plt.plot(x, y, 'ro', figure=fig)
-        plt.plot(x_pos, y_pos, linestyle='-', color='red',
-                 alpha=0.4, linewidth=5, figure=fig)
+        ax.plot(x, y, 'ro')
+        ax.plot(x_pos, y_pos, linestyle='-', color='red', alpha=0.4, linewidth=5)
     else:
-        plt.plot(x, y, 'go', figure=fig)
-        plt.plot(x_pos, y_pos, linestyle='-', color='green',
-                 alpha=0.4, linewidth=5, figure=fig)
+        ax.plot(x, y, 'go')
+        ax.plot(x_pos, y_pos, linestyle='-', color='green', alpha=0.4, linewidth=5)
 
 def distance(x, y):
     x = np.array(x)
@@ -146,7 +139,14 @@ def getAngleFromLandmarks(landmarks, image_width, image_height):
     return elbowAngle, kneeAngle, elbowCoord, kneeCoord, headCoord, handCoord
 
 # Modified detect_shot function to use MediaPipe
-def detect_shot(frame, trace, width, height, sess, image_tensor, boxes, scores, classes, num_detections, previous, during_shooting, shot_result, fig, pose_estimator, shooting_pose): # Changed datum, opWrapper to pose_estimator
+def detect_shot(frame, trace, width, height, model, image_tensor=None, boxes=None, scores=None, classes=None, num_detections=None, previous=None, during_shooting=None, shot_result=None, fig=None, pose_estimator=None, shooting_pose=None): 
+    """
+    Detect shots in a frame.
+    
+    Args:
+        frame (numpy.ndarray): Input image frame in RGB format
+        ...
+    """
     global shooting_result
 
     if(shot_result['displayFrames'] > 0):
@@ -157,16 +157,7 @@ def detect_shot(frame, trace, width, height, sess, image_tensor, boxes, scores, 
         shooting_pose['ballInHand_frames'] += 1
 
     # --- MediaPipe Pose Detection ---
-    # Convert the BGR image to RGB.
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    # To improve performance, optionally mark the image as not writeable to
-    # pass by reference.
-    frame_rgb.flags.writeable = False
-    # Process the image and find poses
-    results = pose_estimator.process(frame_rgb)
-    # Convert the image back to BGR.
-    # frame_rgb.flags.writeable = True # No need if we draw on the original 'frame'
-    # frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR) # Don't convert back yet, draw on original BGR 'frame'
+    results = pose_estimator.process(frame)
     
     # Extract landmarks and calculate angles
     elbowAngle, kneeAngle, elbowCoord, kneeCoord, headCoord, handCoord = getAngleFromLandmarks(results.pose_landmarks, width, height)
@@ -179,13 +170,9 @@ def detect_shot(frame, trace, width, height, sess, image_tensor, boxes, scores, 
             results.pose_landmarks,
             mp_pose.POSE_CONNECTIONS,
             landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
-    # --- End MediaPipe Pose Detection ---
-
-    frame_expanded = np.expand_dims(frame, axis=0)
-    # main tensorflow detection
-    (boxes, scores, classes, num_detections) = sess.run(
-        [boxes, scores, classes, num_detections],
-        feed_dict={image_tensor: frame_expanded})
+    
+    # --- Object Detection (Basketball & Hoop) --- 
+    boxes, scores, classes, num_detections = model.run(frame)
 
     # displaying joint angle and release angle - adjusted coordinates slightly if needed
     # Add checks to only draw if angle was calculated (coord != [0,0])
@@ -349,94 +336,99 @@ def detect_shot(frame, trace, width, height, sess, image_tensor, boxes, scores, 
 
 
 def detect_image(img, response):
+    """Process a single image for detection using the appropriate model.
+    
+    This function can use either the TensorFlow model or the YOLO model,
+    depending on which one has been initialized.
+    
+    Args:
+        img (numpy.ndarray): Input image
+        response (list): List to append detection results to
+    
+    Returns:
+        numpy.ndarray: Annotated image with detections
+    """
+    # Get model (assuming it has been initialized)
+    model = yolo_init()
     height, width = img.shape[:2]
-    detection_graph, image_tensor, boxes, scores, classes, num_detections = tensorflow_init()
+    boxes, scores, classes, num_detections = model.run(img)
 
-    with tf.Session(graph=detection_graph) as sess:
-        img_expanded = np.expand_dims(img, axis=0)
-        (boxes, scores, classes, num_detections) = sess.run(
-            [boxes, scores, classes, num_detections],
-            feed_dict={image_tensor: img_expanded})
-        valid_detections = 0
 
-        for i, box in enumerate(boxes[0]):
-            # print("detect")
-            if (scores[0][i] > 0.5):
-                valid_detections += 1
-                ymin = int((box[0] * height))
-                xmin = int((box[1] * width))
-                ymax = int((box[2] * height))
-                xmax = int((box[3] * width))
-                xCoor = int(np.mean([xmin, xmax]))
-                yCoor = int(np.mean([ymin, ymax]))
-                if(classes[0][i] == 1):  # basketball
-                    cv2.circle(img=img, center=(xCoor, yCoor), radius=25,
-                               color=(255, 0, 0), thickness=-1)
-                    cv2.putText(img, "BALL", (xCoor - 50, yCoor - 50),
-                                cv2.FONT_HERSHEY_COMPLEX, 3, (255, 0, 0), 8)
-                    print("add basketball")
-                    response.append({
-                        'class': 'Basketball',
-                        'detection_detail': {
-                            'confidence': float("{:.5f}".format(scores[0][i])),
-                            'center_coordinate': {'x': xCoor, 'y': yCoor},
-                            'box_boundary': {'x_min': xmin, 'x_max': xmax, 'y_min': ymin, 'y_max': ymax}
-                        }
-                    })
-                if(classes[0][i] == 2):  # Rim
-                    cv2.rectangle(img, (xmin, ymax),
-                                  (xmax, ymin), (48, 124, 255), 10)
-                    cv2.putText(img, "HOOP", (xCoor - 65, yCoor - 65),
-                                cv2.FONT_HERSHEY_COMPLEX, 3, (48, 124, 255), 8)
-                    print("add hoop")
-                    response.append({
-                        'class': 'Hoop',
-                        'detection_detail': {
-                            'confidence': float("{:.5f}".format(scores[0][i])),
-                            'center_coordinate': {'x': xCoor, 'y': yCoor},
-                            'box_boundary': {'x_min': xmin, 'x_max': xmax, 'y_min': ymin, 'y_max': ymax}
-                        }
-                    })
-        
-        if(valid_detections < 2):
-            for i in range(2):
+    for i, box in enumerate(boxes[0]):
+        # print("detect")
+        if (scores[0][i] > 0.5):
+            # valid_detections += 1
+            ymin = int((box[0] * height))
+            xmin = int((box[1] * width))
+            ymax = int((box[2] * height))
+            xmax = int((box[3] * width))
+            xCoor = int(np.mean([xmin, xmax]))
+            yCoor = int(np.mean([ymin, ymax]))
+            if(classes[0][i] == 1):  # basketball
+                cv2.circle(img=img, center=(xCoor, yCoor), radius=25,
+                            color=(255, 0, 0), thickness=-1)
+                cv2.putText(img, "BALL", (xCoor - 50, yCoor - 50),
+                            cv2.FONT_HERSHEY_COMPLEX, 3, (255, 0, 0), 8)
+                print("add basketball")
                 response.append({
-                    'class': 'Not Found',
+                    'class': 'Basketball',
                     'detection_detail': {
-                        'confidence': 0.0,
-                        'center_coordinate': {'x': 0, 'y': 0},
-                        'box_boundary': {'x_min': 0, 'x_max': 0, 'y_min': 0, 'y_max': 0}
+                        'confidence': float("{:.5f}".format(scores[0][i])),
+                        'center_coordinate': {'x': xCoor, 'y': yCoor},
+                        'box_boundary': {'x_min': xmin, 'x_max': xmax, 'y_min': ymin, 'y_max': ymax}
                     }
                 })
+            if(classes[0][i] == 2):  # Rim
+                cv2.rectangle(img, (xmin, ymax),
+                                (xmax, ymin), (48, 124, 255), 10)
+                cv2.putText(img, "HOOP", (xCoor - 65, yCoor - 65),
+                            cv2.FONT_HERSHEY_COMPLEX, 3, (48, 124, 255), 8)
+                print("add hoop")
+                response.append({
+                    'class': 'Hoop',
+                    'detection_detail': {
+                        'confidence': float("{:.5f}".format(scores[0][i])),
+                        'center_coordinate': {'x': xCoor, 'y': yCoor},
+                        'box_boundary': {'x_min': xmin, 'x_max': xmax, 'y_min': ymin, 'y_max': ymax}
+                    }
+                })
+    
+    # if(valid_detections < 2):
+    #     for i in range(2):
+    #         response.append({
+    #             'class': 'Not Found',
+    #             'detection_detail': {
+    #                 'confidence': 0.0,
+    #                 'center_coordinate': {'x': 0, 'y': 0},
+    #                 'box_boundary': {'x_min': 0, 'x_max': 0, 'y_min': 0, 'y_max': 0}
+    #             }
+    #         })
             
     return img
 
 def detect_API(response, img):
-    detection_graph, image_tensor, boxes, scores, classes, num_detections = tensorflow_init()
-    height = img.shape[0]
-    width = img.shape[1]
-    img_expanded = np.expand_dims(img, axis=0)
+    height, width = img.shape[:2]
+    model = yolo_init()
+    boxes, scores, classes, num_detections = model.run(img)
+    
 
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
+    for i, box in enumerate(boxes[0]):
+        if (scores[0][i] > 0.5):
+            ymin = int((box[0] * height))
+            xmin = int((box[1] * width))
+            ymax = int((box[2] * height))
+            xmax = int((box[3] * width))
 
-    with tf.Session(graph=detection_graph, config=config) as sess:
-        (boxes, scores, classes, num_detections) = sess.run([boxes, scores, classes, num_detections],
-                                                            feed_dict={image_tensor: img_expanded})
-        for i, box in enumerate(boxes[0]):
-            if (scores[0][i] > 0.5):
-                ymin = int((box[0] * height))
-                xmin = int((box[1] * width))
-                ymax = int((box[2] * height))
-                xmax = int((box[3] * width))
-                
-                if(classes[0][i] == 1):  # basketball
-                    response.append(
-                        {"label": "basketball", "confidence": round(float(scores[0][i]), 2), "coordinates": [xmin, ymin, xmax, ymax]})
-                elif (classes[0][i] == 0):  # hoop
-                    response.append(
-                        {"label": "hoop", "confidence": round(float(scores[0][i]), 2), "coordinates": [xmin, ymin, xmax, ymax]})
-                elif (classes[0][i] == 2):  # person
-                    response.append(
-                        {"label": "person", "confidence": round(float(scores[0][i]), 2), "coordinates": [xmin, ymin, xmax, ymax]})
+        if(classes[0][i] == 1):
+            response.append({
+                "label": "basketball", 
+                "confidence": round(float(scores[0][i]), 2), 
+                "coordinates": [xmin, ymin, xmax, ymax]
+            })
+        elif (classes[0][i] == 0):
+            response.append({
+                "label": "hoop", 
+                "confidence": round(float(scores[0][i]), 2), 
+                "coordinates": [xmin, ymin, xmax, ymax]
+            })
 
